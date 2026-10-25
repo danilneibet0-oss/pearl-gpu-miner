@@ -1,0 +1,17 @@
+# окружение и артефакты сборки
+.venv/
+__pycache__/
+*.pyc
+build_exe/
+dist_exe/
+release/
+maturin_build.log
+build_exe_log.txt
+
+# официальный репозиторий клонируется отдельно (git clone --depth 1 https://github.com/pearl-research-labs/pearl)
+pearl/
+
+# личные настройки с вашим логином на пуле — не публиковать
+start_pool.bat
+.pytest_cache/
+release_slim/

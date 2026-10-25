@@ -1,0 +1,6 @@
+numpy
+blake3
+pytest
+maturin
+fastjsonschema
+cupy-cuda13x[ctk]
