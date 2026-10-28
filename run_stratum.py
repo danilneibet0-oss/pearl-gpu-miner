@@ -51,12 +51,30 @@ def auto_size(k: int, depth: int = 3, free_bytes: int | None = None) -> int:
     return MATRIX_SIZES[-1]
 
 
+AUTO_K_SIZE, AUTO_K, AUTO_K_DEPTH = 16384, 4096, 2      # единственная конфигурация, где k=4096 выигрывает у 2048
+
+
+def auto_config(free_bytes: int | None = None) -> tuple[int, int, int]:
+    """
+    (m = n, k, depth) по свободной памяти GPU. Замер на RTX 3060 Ti: 16384x16384x4096 при двух попытках в полёте —
+    43.7 TMAC/s против 41.9 при k=2048; на меньших матрицах k=4096 не лучше, поэтому берём его только если эта
+    конфигурация помещается в 60% свободной памяти, иначе k=2048 и размер по auto_size.
+    """
+    if free_bytes is None:
+        import cupy as cp
+        free_bytes = int(cp.cuda.runtime.memGetInfo()[0])
+    if AUTO_K_DEPTH * 6 * 4 * AUTO_K_SIZE * AUTO_K <= 0.6 * free_bytes:
+        return AUTO_K_SIZE, AUTO_K, AUTO_K_DEPTH
+    return auto_size(2048, 3, free_bytes), 2048, 3
+
+
 class FatalMinerError(RuntimeError):
     """Намеренная остановка майнера (повторять бессмысленно): серия отказов, неприменимая цель, нет cert_version."""
 
 
 def new_stats() -> dict:
-    return {"attempts": 0, "found": 0, "accepted": 0, "rejected": 0, "stale": 0, "duplicate": 0, "reconnects": 0}
+    return {"attempts": 0, "found": 0, "accepted": 0, "rejected": 0, "stale": 0, "duplicate": 0, "reconnects": 0,
+            "expected": 0.0}
 
 
 def _report(stats: dict, m: int, n: int, k: int, since: float, attempts0: int, log) -> None:
@@ -65,7 +83,7 @@ def _report(stats: dict, m: int, n: int, k: int, since: float, attempts0: int, l
     tmacs = rate * m * n * k / 1e12
     log(f"{rate:.0f} попыток/с ≈ {tmacs:.1f} TMAC/s | шаров: принято {stats['accepted']}, "
         f"отклонено {stats['rejected']}, устарело {stats['stale']}, дубликатов {stats['duplicate']} | "
-        f"попыток всего {stats['attempts']}")
+        f"попыток всего {stats['attempts']}, ожидалось шаров по целям заданий {stats['expected']:.1f}")
 
 
 def run(client: StratumClient, m: int, n: int, k: int, rank: int = 128, *, cert_version: int | None = None,
@@ -74,6 +92,8 @@ def run(client: StratumClient, m: int, n: int, k: int, rank: int = 128, *, cert_
         report_s: float = 30.0, dense: bool = False, sparse_nnz: int = SPARSE_NNZ) -> dict:
     stop = stop or threading.Event()
     cfg = ref.default_config(k, rank)
+    rt, ct = pp.tiles_for(cfg, m, n)
+    n_tiles, last_target = len(rt) * len(ct), None
     stats = stats if stats is not None else new_stats()
     bad_in_row, t0 = 0, time.time()
     last_rep, rep_attempts = time.time(), stats["attempts"]
@@ -87,6 +107,10 @@ def run(client: StratumClient, m: int, n: int, k: int, rank: int = 128, *, cert_
         bound = job_bound(job, cfg)
         if bound is None:
             raise FatalMinerError("цель задания неприменима к этой конфигурации")
+        p_hit = n_tiles * bound / (ref.U256_MAX + 1)        # вероятность шара за попытку (тайлы независимы)
+        if job.target != last_target:
+            last_target = job.target
+            log(f"цель задания {job.target:064x}, шаров на попытку ≈ {p_hit:.3g} (≈ {1 / p_hit:.0f} попыток на шар)")
         header = job.header()
         cert = job.cert_version if job.cert_version is not None else cert_version
         if cert is None:
@@ -96,6 +120,7 @@ def run(client: StratumClient, m: int, n: int, k: int, rank: int = 128, *, cert_
                                                    range(base, base + batch), bound=bound, depth=depth,
                                                    sparse_nnz=None if (dense or not client.gzip) else sparse_nnz):
             stats["attempts"] += 1
+            stats["expected"] += p_hit
             if time.time() - last_rep >= report_s:
                 _report(stats, m, n, k, last_rep, rep_attempts, log)
                 last_rep, rep_attempts = time.time(), stats["attempts"]
@@ -145,7 +170,7 @@ def mine_forever(host: str, port: int, login: str, m: int, n: int, k: int, rank:
                  max_shares: int | None = None, max_reconnects: int | None = None,
                  base_delay: float = 2.0, max_delay: float = 60.0,
                  stop: threading.Event | None = None, log=print, report_s: float = 30.0,
-                 dense: bool = False, max_crashes: int = 5) -> dict:
+                 dense: bool = False, max_crashes: int = 5, depth: int = 3) -> dict:
     """
     Майнинг «пока не остановят»: при обрыве/таймауте — переподключение с паузой base_delay·2^n (до max_delay),
     пауза сбрасывается после успешной авторизации. Фатальные ошибки (неверный кошелёк, серия отказов шаров)
@@ -165,7 +190,7 @@ def mine_forever(host: str, port: int, login: str, m: int, n: int, k: int, rank:
                 log(f"подключено к {host}:{port}, авторизация принята; gzip (v2): {'да' if client.gzip else 'нет'}, "
                     f"матрицы: {'случайные' if (dense or not client.gzip) else 'разреженные'}")
                 run(client, m, n, k, rank, cert_version=cert_version, max_shares=max_shares, stop=stop,
-                    log=log, stats=stats, report_s=report_s, dense=dense)
+                    log=log, stats=stats, report_s=report_s, dense=dense, depth=depth)
         except FatalMinerError:
             raise
         except StratumError as e:

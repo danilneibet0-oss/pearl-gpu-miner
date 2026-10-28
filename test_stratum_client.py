@@ -742,13 +742,25 @@ def test_cli_auto_size_zero_means_auto(monkeypatch):
     seen = {}
 
     def fake_forever(host, port, login, m, n, k, rank=128, **kw):
-        seen.update(m=m, n=n, k=k)
+        seen.update(m=m, n=n, k=k, depth=kw.get("depth"))
         return {"accepted": 0}
 
     monkeypatch.setattr(run_stratum, "mine_forever", fake_forever)
     monkeypatch.setattr(run_stratum, "auto_size", lambda k, depth=3, free_bytes=None: 8192)
+    monkeypatch.setattr(run_stratum, "auto_config", lambda free_bytes=None: (8192, 4096, 2))
     assert miner.main(["--stratum", "--pool", "127.0.0.1:1", "--wallet", f"{WALLET}/rig"]) == 0
-    assert (seen["m"], seen["n"]) == (8192, 8192)
+    assert (seen["m"], seen["n"], seen["k"], seen["depth"]) == (8192, 8192, 4096, 2)
     seen.clear()
     assert miner.main(["--stratum", "--pool", "127.0.0.1:1", "--wallet", f"{WALLET}/rig", "--m", "4096", "--n", "2048"]) == 0
-    assert (seen["m"], seen["n"]) == (4096, 2048)                                     # явные значения главнее автовыбора
+    assert (seen["m"], seen["n"], seen["k"]) == (4096, 2048, 2048)                    # явные значения главнее автовыбора
+    seen.clear()
+    assert miner.main(["--stratum", "--pool", "127.0.0.1:1", "--wallet", f"{WALLET}/rig", "--k", "2048"]) == 0
+    assert (seen["m"], seen["n"], seen["k"], seen["depth"]) == (8192, 8192, 2048, 3)  # k задан вручную -> размер по auto_size
+
+
+def test_auto_config_picks_k4096_only_when_it_fits():
+    gib = 1 << 30
+    assert run_stratum.auto_config(free_bytes=7 * gib) == (16384, 4096, 2)
+    assert run_stratum.auto_config(free_bytes=int(5.1 * gib)) == (16384, 4096, 2)
+    assert run_stratum.auto_config(free_bytes=int(4.9 * gib)) == (16384, 2048, 3)    # k=4096 не помещается -> прежний режим
+    assert run_stratum.auto_config(free_bytes=3 * gib) == (8192, 2048, 3)

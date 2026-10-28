@@ -242,3 +242,44 @@ def test_pipelined_equals_sequential(cert, depth):
             assert g.hash_a == w.hash_a and g.hash_b == w.hash_b
             np.testing.assert_array_equal(g.a, w.a)
             np.testing.assert_array_equal(g.b, w.b)
+
+
+# ---------------------------------------------------------------------------
+# Быстрый путь для разреженных матриц: буфер переиспользуется, хеш считается только по чанкам с ненулевыми ячейками
+# ---------------------------------------------------------------------------
+def test_sparse_slot_hash_equals_dense_hash_across_reuse_and_jobs():
+    m, n, k = 256, 384, 2048
+    slot = pp.SparseSlot(m, n, k, 32)
+    for jk in (bytes(range(32)), bytes(range(1, 33))):             # смена ключа задания -> другой кэш нулевых чанков
+        jkey_w = pp._words(jk)
+        for s in range(4):                                         # буфер переиспользуется: старые ячейки стираются
+            slot.fill(1000 + 2 * s, 1001 + 2 * s)
+            np.testing.assert_array_equal(cp.asnumpy(slot.a), cp.asnumpy(pp.gen_sparse((m, k), 1000 + 2 * s)))
+            np.testing.assert_array_equal(cp.asnumpy(slot.bt), cp.asnumpy(pp.gen_sparse((n, k), 1001 + 2 * s)))
+            ha = pp.hash_matrix_sparse(slot.a, jkey_w, pp.zero_chunk_cvs(jk, slot.a.size), slot.ids_a)
+            hb = pp.hash_matrix_sparse(slot.bt, jkey_w, pp.zero_chunk_cvs(jk, slot.bt.size), slot.ids_b)
+            assert pp._bytes(ha) == pp._bytes(pp.hash_matrix_dev(slot.a, jkey_w))
+            assert pp._bytes(hb) == pp._bytes(pp.hash_matrix_dev(slot.bt, jkey_w))
+
+
+@pytest.mark.parametrize("cert", [2, 3])
+@pytest.mark.parametrize("depth", [1, 2, 3])
+def test_pipelined_sparse_equals_sequential_sparse(cert, depth):
+    m, n, k = 256, 384, 2048
+    cfg = ref.default_config(k, RANK)
+    header = _header(0x1E00FFFF)
+    seeds = list(range(12))
+    want = [pp.mine_random(m, n, k, header, cfg, cert, seed=s, sparse_nnz=32) for s in seeds]
+    got = dict(pp.mine_random_pipelined(m, n, k, header, cfg, cert, seeds, depth=depth, sparse_nnz=32))
+    assert sorted(got) == seeds
+    found = 0
+    for s, w in zip(seeds, want):
+        g = got[s]
+        assert (w is None) == (g is None)
+        if w is not None:
+            found += 1
+            assert g.jackpot_hash == w.jackpot_hash and g.a_rows == w.a_rows and g.b_cols == w.b_cols
+            assert g.hash_a == w.hash_a and g.hash_b == w.hash_b
+            np.testing.assert_array_equal(g.a, w.a)
+            np.testing.assert_array_equal(g.b, w.b)
+    assert found > 0                                                # проверка не вырождена: решения реально находились

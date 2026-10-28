@@ -270,6 +270,52 @@ extern "C" __global__ void scatter_sparse(signed char* __restrict__ out, long lo
     out[pos] = (signed char)sig_map((u32)w);
 }
 
+// то же, что scatter_sparse, но для переиспользуемого буфера: clear=1 стирает ячейки прошлой попытки (тот же seed),
+// иначе пишет новые и сохраняет номера затронутых 1024-байтовых чанков (для пересчёта только их хешей)
+extern "C" __global__ void scatter_sparse_ids(signed char* __restrict__ out, long long n, u64 seed, int nnz,
+                                              int clear, int* __restrict__ ids)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= nnz) return;
+    u64 z = seed + (u64)(j + 1) * 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    u64 w = (z ^ 0xD1B54A32D192ED03ull) * 0x9E3779B97F4A7C15ull;
+    w = (w ^ (w >> 29)) * 0xBF58476D1CE4E5B9ull;
+    w ^= w >> 32;
+    const long long pos = (long long)(z % (u64)n);
+    if (clear) { out[pos] = 0; return; }
+    out[pos] = (signed char)sig_map((u32)w);
+    ids[j] = (int)(pos >> 10);
+}
+
+// пересчёт CV только перечисленных чанков (остальные уже лежат в cvs: хеши нулевых чанков). Только полные чанки, nchunks > 1.
+extern "C" __global__ void blake3_chunks_list(const u32* __restrict__ data, const u32* __restrict__ key,
+                                              u32* __restrict__ cvs, const int* __restrict__ ids, int nids)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nids) return;
+    const u32 c = (u32)ids[t];
+    u32 cv[8], nx[8], blk[16];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) cv[i] = key[i];
+    for (int b = 0; b < 16; ++b) {
+        const uint4* p = (const uint4*)(data + (((u64)c * 1024 + b * 64) >> 2));
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const uint4 v = __ldg(p + w);
+            blk[4*w] = v.x; blk[4*w+1] = v.y; blk[4*w+2] = v.z; blk[4*w+3] = v.w;
+        }
+        const u32 fl = F_KEYED | (b == 0 ? F_CHUNK_START : 0u) | (b == 15 ? F_CHUNK_END : 0u);
+        compress_cv(cv, blk, c, 64, fl, nx);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) cv[i] = nx[i];
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) cvs[(u64)c * 8 + i] = cv[i];
+}
+
 // первый (в порядке ti, tj) тайл с jackpot_hash <= bound
 extern "C" __global__ void search(const u32* __restrict__ jp, const u32* __restrict__ key_g,
                                   const u32* __restrict__ bound_g, int ntiles, u32* __restrict__ best)
@@ -330,13 +376,49 @@ def hash_matrix_dev(buf: cp.ndarray, key_w: cp.ndarray) -> cp.ndarray:
     cur = cp.empty((nchunks, 8), dtype=cp.uint32)
     g, b = _blocks(nchunks, 64)
     _fn("blake3_chunks")(g, b, (data, np.uint64(nbytes), key_w, cur, np.uint32(nchunks)))
-    n = nchunks
+    return _merge_cvs(cur, nchunks, key_w)
+
+
+def _merge_cvs(cur: cp.ndarray, n: int, key_w: cp.ndarray) -> cp.ndarray:
     while n > 1:
         groups = (n + 1023) // 1024
         nxt = cp.empty((groups, 8), dtype=cp.uint32)
         _fn("blake3_merge")((groups,), (512,), (cur, nxt, np.uint32(n), key_w, np.int32(1 if groups == 1 else 0)))
         cur, n = nxt, groups
     return cur[0]
+
+
+_zero_cv_cache: dict = {}
+
+
+def zero_chunk_cvs(key: bytes, nbytes: int) -> cp.ndarray:
+    """CV всех чанков нулевой матрицы nbytes (хеш чанка зависит только от ключа и номера чанка) — один раз на задание."""
+    got = _zero_cv_cache.get((key, nbytes))
+    if got is None:
+        if len(_zero_cv_cache) > 8:
+            _zero_cv_cache.clear()
+        nchunks = nbytes // 1024
+        data = cp.zeros(nbytes, dtype=cp.uint8)
+        got = cp.empty((nchunks, 8), dtype=cp.uint32)
+        g, b = _blocks(nchunks, 64)
+        _fn("blake3_chunks")(g, b, (data, np.uint64(nbytes), _words(key), got, np.uint32(nchunks)))
+        cp.cuda.get_current_stream().synchronize()          # кэш общий для потоков: к моменту чтения другим потоком он готов
+        _zero_cv_cache[(key, nbytes)] = got
+    return got
+
+
+def hash_matrix_sparse(buf: cp.ndarray, key_w: cp.ndarray, zero_cvs: cp.ndarray, ids: cp.ndarray) -> cp.ndarray:
+    """
+    То же, что hash_matrix_dev для матрицы, где ненулевыми могут быть только чанки из ids: CV остальных берутся из
+    zero_cvs, пересчитываются лишь перечисленные. Требует размер, кратный 1024, и больше одного чанка.
+    """
+    nchunks = zero_cvs.shape[0]
+    cur = cp.empty_like(zero_cvs)                      # не .copy(): элементные ядра CuPy не компилируются при кириллице в пути
+    cp.cuda.runtime.memcpyAsync(cur.data.ptr, zero_cvs.data.ptr, cur.nbytes, cp.cuda.runtime.memcpyDeviceToDevice,
+                                cp.cuda.get_current_stream().ptr)
+    g, b = _blocks(int(ids.size), 32)
+    _fn("blake3_chunks_list")(g, b, (buf, key_w, cur, ids, np.int32(ids.size)))
+    return _merge_cvs(cur, nchunks, key_w)
 
 
 def hash_matrix(buf: cp.ndarray, key: bytes) -> bytes:
@@ -492,15 +574,52 @@ class _Attempt:
     __slots__ = ("stream", "a", "bt", "a_n", "bt_n", "rank", "rt", "ct", "a_seed_w", "ha", "hb", "best", "idx", "jp")
 
 
+class SparseSlot:
+    """
+    Переиспользуемые буферы разреженных A (m×k) и B^T (n×k) для одного CUDA-потока: между попытками стираются только
+    ячейки прошлой попытки (а не заливается нулями вся матрица), а хеш считается только по чанкам с ненулевыми ячейками.
+    Содержимое a/bt валидно до следующего fill() этого слота.
+    """
+
+    def __init__(self, m: int, n: int, k: int, nnz: int = 32):
+        assert (m * k) % 1024 == 0 and (n * k) % 1024 == 0 and m * k > 1024 and n * k > 1024
+        self.m, self.n, self.k, self.nnz = m, n, k, nnz
+        self.a, self.bt = cp.zeros((m, k), dtype=cp.int8), cp.zeros((n, k), dtype=cp.int8)
+        self.ids_a, self.ids_b = cp.empty(nnz, dtype=cp.int32), cp.empty(nnz, dtype=cp.int32)
+        self.prev = None
+
+    def _scatter(self, buf, seed, clear, ids):
+        g, b = _blocks(self.nnz, 64)
+        _fn("scatter_sparse_ids")(g, b, (buf, np.int64(buf.size), np.uint64(seed & (2**64 - 1)), np.int32(self.nnz),
+                                         np.int32(clear), ids))
+
+    def fill(self, seed_a: int, seed_b: int) -> None:
+        if self.prev is not None:
+            self._scatter(self.a, self.prev[0], 1, self.ids_a)
+            self._scatter(self.bt, self.prev[1], 1, self.ids_b)
+        self._scatter(self.a, seed_a, 0, self.ids_a)
+        self._scatter(self.bt, seed_b, 0, self.ids_b)
+        self.prev = (seed_a, seed_b)
+
+
 def launch_attempt(a: cp.ndarray, bt: cp.ndarray, header: ref.IncompleteBlockHeader, cfg: ref.MiningConfiguration,
-                   cert_version: int, bound: int | None = None) -> _Attempt:
-    """Ставит в очередь текущего CUDA-потока всю попытку для A (m×k) и B^T (n×k), int8 в [-64, 64]; без ожидания."""
+                   cert_version: int, bound: int | None = None, sparse: SparseSlot | None = None) -> _Attempt:
+    """
+    Ставит в очередь текущего CUDA-потока всю попытку для A (m×k) и B^T (n×k), int8 в [-64, 64]; без ожидания.
+    sparse: слот, в котором лежат a и bt (быстрый хеш по ненулевым чанкам; результат тот же, что у hash_matrix_dev).
+    """
     rank = cfg.rank
     m, k = a.shape
     n = bt.shape[0]
-    jkey_w = _words(ref.job_key(header, cfg))
-    ha = hash_matrix_dev(a, jkey_w)
-    hb = hash_matrix_dev(bt, jkey_w)
+    jkey = ref.job_key(header, cfg)
+    jkey_w = _words(jkey)
+    if sparse is not None:
+        assert a is sparse.a and bt is sparse.bt
+        ha = hash_matrix_sparse(a, jkey_w, zero_chunk_cvs(jkey, a.size), sparse.ids_a)
+        hb = hash_matrix_sparse(bt, jkey_w, zero_chunk_cvs(jkey, bt.size), sparse.ids_b)
+    else:
+        ha = hash_matrix_dev(a, jkey_w)
+        hb = hash_matrix_dev(bt, jkey_w)
     seeds = derive_seeds_dev(jkey_w, ha, hb, m, n, cert_version)
     b_seed_w, a_seed_w = seeds[:8], seeds[8:]
 
@@ -544,6 +663,8 @@ def mine_attempt(a: cp.ndarray, bt: cp.ndarray, header: ref.IncompleteBlockHeade
 
 
 _streams: list = []
+_sparse_slots: dict = {}
+FAST_SPARSE = True                                          # False — старый путь (для сравнения скоростей и шаров)
 
 
 def mine_random_pipelined(m: int, n: int, k: int, header: ref.IncompleteBlockHeader, cfg: ref.MiningConfiguration,
@@ -556,12 +677,24 @@ def mine_random_pipelined(m: int, n: int, k: int, header: ref.IncompleteBlockHea
     """
     while len(_streams) < depth:
         _streams.append(cp.cuda.Stream(non_blocking=True))
+    fast_sparse = FAST_SPARSE and bool(sparse_nnz) and (m * k) % 1024 == 0 and (n * k) % 1024 == 0 and m * k > 1024 and n * k > 1024
     pending: list = []
     for i, seed in enumerate(seeds):
         stream = _streams[i % depth]
         with stream:
-            a, bt = _gen_matrices(m, n, k, seed, sparse_nnz)
-            pending.append((seed, launch_attempt(a, bt, header, cfg, cert_version, bound)))
+            slot = None
+            if fast_sparse:
+                key = (i % depth, m, n, k, sparse_nnz)
+                slot = _sparse_slots.get(key)
+                if slot is None:
+                    for old in [x for x in _sparse_slots if x[1:] != key[1:]]:
+                        del _sparse_slots[old]              # размер сменился — старые буферы больше не нужны
+                    slot = _sparse_slots[key] = SparseSlot(m, n, k, sparse_nnz)
+                slot.fill(seed * 2, seed * 2 + 1)
+                a, bt = slot.a, slot.bt
+            else:
+                a, bt = _gen_matrices(m, n, k, seed, sparse_nnz)
+            pending.append((seed, launch_attempt(a, bt, header, cfg, cert_version, bound, sparse=slot)))
         if len(pending) >= depth:
             sd, st = pending.pop(0)
             yield sd, finish_attempt(st)

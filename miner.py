@@ -46,13 +46,23 @@ def parse_pool(pool: str) -> tuple[str, int]:
 
 
 def _sizes(args) -> tuple[int, int]:
-    """m, n попытки: заданные вручную или автоматически по свободной памяти GPU (0 = авто)."""
+    """m, n (и k, если он 0 = авто) попытки: заданные вручную или автоматически по свободной памяти GPU (0 = авто)."""
     import run_stratum
     m, n = args.m, args.n
+    if not args.k:
+        if m or n:
+            args.k = 2048                       # размер задан вручную — k по умолчанию прежний
+        else:
+            try:
+                m, args.k, args.depth = run_stratum.auto_config()
+                n = m
+            except Exception as e:  # noqa: BLE001 — нет GPU/CUDA: честно сообщаем, а не падаем с трассировкой
+                print(f"Не удалось определить память GPU ({e}); ставлю 4096x4096x2048. Укажите --m, --n вручную при необходимости.")
+                m, n, args.k = 4096, 4096, 2048
     if not m or not n:
         try:
-            auto = run_stratum.auto_size(args.k)
-        except Exception as e:      # noqa: BLE001 — нет GPU/CUDA: честно сообщаем, а не падаем с трассировкой
+            auto = run_stratum.auto_size(args.k, args.depth)
+        except Exception as e:      # noqa: BLE001
             print(f"Не удалось определить память GPU ({e}); ставлю размер 4096. Укажите --m и --n вручную при необходимости.")
             auto = 4096
         m, n = m or auto, n or auto
@@ -72,7 +82,8 @@ def run_pool(args, host: str, port: int) -> int:
     try:
         stats = run_stratum.mine_forever(host, port, args.wallet, m, n, args.k, args.rank,
                                          password=args.password or None, tls=args.tls,
-                                         cert_version=args.cert_version, stop=stop, dense=args.dense)
+                                         cert_version=args.cert_version, stop=stop, dense=args.dense,
+                                         depth=args.depth)
     except KeyboardInterrupt:
         stop.set()
         print("Остановлено пользователем.")
@@ -122,7 +133,8 @@ def main(argv=None) -> int:
     ap.add_argument("--password", default="", help="пароль пула (например d=500000 для стартовой сложности)")
     ap.add_argument("--m", type=int, default=0, help="строк A в попытке; 0 — автоматически по памяти GPU (до 16384)")
     ap.add_argument("--n", type=int, default=0, help="столбцов B в попытке; 0 — автоматически")
-    ap.add_argument("--k", type=int, default=2048)
+    ap.add_argument("--k", type=int, default=0, help="длина скалярного произведения (кратна 64, >= 2048); 0 — автоматически")
+    ap.add_argument("--depth", type=int, default=3, help="сколько попыток считается одновременно")
     ap.add_argument("--rank", type=int, default=128)
     args = ap.parse_args(argv)
     if args.selftest:
