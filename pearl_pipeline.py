@@ -471,7 +471,7 @@ def search_jackpots(jp: cp.ndarray, a_seed, bound: int) -> int:
 def search_fused(a_n, bt_n, rank: int, rt: np.ndarray, ct: np.ndarray, a_seed, bound: int) -> int:
     """Ядро джекпота (v2) со встроенным хешем тайлов и сравнением со сложностью; массив джекпотов не пишется."""
     best = _new_best()
-    pearl_gpu.jackpots_dev(a_n, bt_n, rank, rt, ct, "v2", search=(_as_words(a_seed), _bound_words(bound), best))
+    pearl_gpu.jackpots_dev(a_n, bt_n, rank, rt, ct, "auto", search=(_as_words(a_seed), _bound_words(bound), best))
     return _read_best(best)
 
 
@@ -514,7 +514,7 @@ def launch_attempt(a: cp.ndarray, bt: cp.ndarray, header: ref.IncompleteBlockHea
     st.a_seed_w, st.ha, st.hb, st.best, st.idx, st.jp = a_seed_w, ha, hb, None, None, None
     if pearl_gpu.v2_supported(m, n, k, rank, rt.shape[1], ct.shape[1]):
         st.best = _new_best()
-        pearl_gpu.jackpots_dev(a_n, bt_n, rank, rt, ct, "v2",
+        pearl_gpu.jackpots_dev(a_n, bt_n, rank, rt, ct, "auto",
                                search=(a_seed_w, _bound_words(bound), st.best))
     else:                                                   # универсальное ядро: поиск отдельным запуском
         st.jp = pearl_gpu.jackpots_dev(a_n, bt_n, rank, rt, ct)

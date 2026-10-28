@@ -39,6 +39,8 @@ def run() -> bool:
     want = ref.jackpots_all_tiles(a.astype(np.int32), bt.astype(np.int32), 128, rt, ct)
     check("ядро джекпота v2 (INT8 тензорные ядра) = эталон",
           np.array_equal(pearl_gpu.jackpots(a, bt, 128, rt, ct, variant="v2"), want))
+    check("ядро джекпота v3 (рабочее для rank 128) = эталон",
+          np.array_equal(pearl_gpu.jackpots(a, bt, 128, rt, ct, variant="v3"), want))
 
     header = ref.IncompleteBlockHeader(1, bytes(32), bytes(range(32)), 1_700_000_000, 0x1E00FFFF)
     cfg2 = ref.default_config(2048)

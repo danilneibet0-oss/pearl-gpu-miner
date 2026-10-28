@@ -45,23 +45,39 @@ def parse_pool(pool: str) -> tuple[str, int]:
     return host, int(port)
 
 
+def _sizes(args) -> tuple[int, int]:
+    """m, n попытки: заданные вручную или автоматически по свободной памяти GPU (0 = авто)."""
+    import run_stratum
+    m, n = args.m, args.n
+    if not m or not n:
+        try:
+            auto = run_stratum.auto_size(args.k)
+        except Exception as e:      # noqa: BLE001 — нет GPU/CUDA: честно сообщаем, а не падаем с трассировкой
+            print(f"Не удалось определить память GPU ({e}); ставлю размер 4096. Укажите --m и --n вручную при необходимости.")
+            auto = 4096
+        m, n = m or auto, n or auto
+    return m, n
+
+
 def run_pool(args, host: str, port: int) -> int:
     import threading
     from stratum_client import StratumError
     import run_stratum
 
-    print(f"Майнинг в пул {host}:{port} ({'TLS' if args.tls else 'TCP'}), логин {args.wallet}. Остановка: Ctrl+C.")
+    m, n = _sizes(args)
+    print(f"Майнинг в пул {host}:{port} ({'TLS' if args.tls else 'TCP'}), логин {args.wallet}, матрицы {m}x{n}x{args.k}. "
+          "Остановка: Ctrl+C.")
     stop = threading.Event()
     stats = None
     try:
-        stats = run_stratum.mine_forever(host, port, args.wallet, args.m, args.n, args.k, args.rank,
+        stats = run_stratum.mine_forever(host, port, args.wallet, m, n, args.k, args.rank,
                                          password=args.password or None, tls=args.tls,
                                          cert_version=args.cert_version, stop=stop, dense=args.dense)
     except KeyboardInterrupt:
         stop.set()
         print("Остановлено пользователем.")
         return 0
-    except (StratumError, RuntimeError, ConnectionError, TimeoutError, OSError) as e:
+    except (StratumError, RuntimeError, ConnectionError, TimeoutError, OSError, ValueError, AttributeError) as e:
         print(f"Остановлено: {e}")
         return 1
     print(stats)
@@ -104,8 +120,8 @@ def main(argv=None) -> int:
     ap.add_argument("--dense", action="store_true",
                     help="всегда случайные (плотные) матрицы; по умолчанию при gzip-протоколе пула — разреженные")
     ap.add_argument("--password", default="", help="пароль пула (например d=500000 для стартовой сложности)")
-    ap.add_argument("--m", type=int, default=4096)
-    ap.add_argument("--n", type=int, default=4096)
+    ap.add_argument("--m", type=int, default=0, help="строк A в попытке; 0 — автоматически по памяти GPU (до 16384)")
+    ap.add_argument("--n", type=int, default=0, help="столбцов B в попытке; 0 — автоматически")
     ap.add_argument("--k", type=int, default=2048)
     ap.add_argument("--rank", type=int, default=128)
     args = ap.parse_args(argv)
@@ -139,10 +155,11 @@ def main(argv=None) -> int:
     from gateway_client import GatewayClient
     import run_miner
 
-    print(f"GPU-майнер pearlhash -> gateway {host}:{port}, матрицы {args.m}x{args.n}x{args.k}, rank {args.rank}")
+    m, n = _sizes(args)
+    print(f"GPU-майнер pearlhash -> gateway {host}:{port}, матрицы {m}x{n}x{args.k}, rank {args.rank}")
     try:
         with GatewayClient(host, port) as client:
-            stats = run_miner.run(client, args.m, args.n, args.k, args.rank)
+            stats = run_miner.run(client, m, n, args.k, args.rank)
         print(stats)
     except KeyboardInterrupt:
         print("Остановлено.")

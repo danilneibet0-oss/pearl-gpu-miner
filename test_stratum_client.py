@@ -56,9 +56,20 @@ class FakePool:
     def _notify(self):
         return {"id": None, "method": "mining.notify", "params": self.job}
 
+    error_style = "dict"                 # как пул кодирует ошибки: dict / list / str / message
+
     @staticmethod
     def _err(rid, code, msg):
-        return {"error": {"code": code, "msg": msg}, "id": rid, "result": None}
+        style = FakePool.error_style
+        if style == "list":              # классический Stratum v1: [код, сообщение, данные]
+            err = [code, msg, None]
+        elif style == "str":
+            err = f"{code}: {msg}"
+        elif style == "message":
+            err = {"code": code, "message": msg}
+        else:
+            err = {"code": code, "msg": msg}
+        return {"error": err, "id": rid, "result": None}
 
     def _handle(self, req):
         self.raw_requests.append(req)
@@ -609,3 +620,135 @@ def test_friendly_errors_for_broken_bat_values(capsys):
     assert "без знаков %" in capsys.readouterr().out
     assert miner.main(["--stratum", "--pool", "prl-ru.kryptex.network:7048", "--wallet", "ВАШ_USERNAME/worker1"]) == 2
     assert "заглушка" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Регрессия ночного падения: Kryptex ответил на stale-шар ошибкой-СПИСКОМ, и майнер упал
+# с AttributeError: 'list' object has no attribute 'get'
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("style,expected_code", [("dict", 21), ("list", 21), ("message", 21), ("str", 21)])
+def test_error_formats_from_pool_are_all_understood(style, expected_code, monkeypatch):
+    monkeypatch.setattr(FakePool, "error_style", style)
+    p = FakePool(v2=True).start()
+    try:
+        with connect(p) as c:
+            c.authorize(f"{WALLET}/rig")
+            c.wait_job(5)
+            with pytest.raises(StratumError) as e:
+                c.submit("00000000_9", "AAAA")
+            assert e.value.code == expected_code, style
+    finally:
+        p.stop()
+
+
+def test_error_parser_edge_cases():
+    from stratum_client import parse_error
+    assert parse_error([21, "Job not found", None]) == (21, "Job not found")
+    assert parse_error([21]) == (21, "")
+    assert parse_error(["21", "x"]) == (21, "x")
+    assert parse_error({"code": "23", "message": "low diff"}) == (23, "low diff")
+    assert parse_error({"msg": "no code"}) == (0, "no code")
+    assert parse_error("boom") == (0, "boom")
+    assert parse_error(26) == (26, "")
+    assert parse_error(["junk", "m"]) == (0, "m")
+    assert parse_error([]) == (0, "")
+    assert parse_error(True)[0] == 0
+
+
+def test_miner_survives_stale_error_in_list_form(monkeypatch):
+    monkeypatch.setattr(FakePool, "error_style", "list")
+    p = FakePool(v2=True).start()
+    try:
+        with connect(p) as c:
+            c.authorize(f"{WALLET}/rig")
+            job = c.wait_job(5)
+            real_submit = c.submit
+            calls = {"n": 0}
+
+            def flaky(job_id, proof):                      # первый шар «устарел» — как у Kryptex
+                calls["n"] += 1
+                return real_submit("00000000_9" if calls["n"] == 1 else job_id, proof)
+
+            c.submit = flaky
+            stats = run_stratum.run(c, 256, 256, 2048, cert_version=CERT, max_shares=3, log=lambda *_: None)
+        assert stats["stale"] >= 1 and stats["accepted"] == 3
+    finally:
+        p.stop()
+
+
+def test_submit_returning_false_is_not_counted_as_accepted():
+    p = FakePool(v2=True).start()
+    try:
+        with connect(p) as c:
+            c.authorize(f"{WALLET}/rig")
+            c.wait_job(5)
+            c.submit = lambda *_: False                    # пул ответил result=false без ошибки
+            with pytest.raises(run_stratum.FatalMinerError):
+                run_stratum.run(c, 256, 256, 2048, cert_version=CERT, max_shares=1, log=lambda *_: None)
+            assert True
+    finally:
+        p.stop()
+
+
+def test_mine_forever_restarts_after_unexpected_exception(monkeypatch):
+    """Любое неожиданное исключение внутри цикла не должно останавливать ночной майнинг."""
+    p = FakePool(v2=True).start()
+    real_run = run_stratum.run
+    state = {"n": 0}
+
+    def exploding_run(*a, **kw):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise AttributeError("'list' object has no attribute 'get'")
+        return real_run(*a, **kw)
+
+    monkeypatch.setattr(run_stratum, "run", exploding_run)
+    logs = []
+    try:
+        stats = run_stratum.mine_forever("127.0.0.1", p.port, f"{WALLET}/rig", 256, 256, 2048, cert_version=CERT,
+                                         max_shares=2, base_delay=0.05, log=logs.append)
+        assert stats["accepted"] == 2 and stats["reconnects"] >= 1
+        assert any("Неожиданная ошибка" in str(m) for m in logs)
+    finally:
+        p.stop()
+
+
+def test_mine_forever_gives_up_after_repeated_crashes(monkeypatch):
+    p = FakePool(v2=True).start()
+    monkeypatch.setattr(run_stratum, "run", lambda *a, **kw: (_ for _ in ()).throw(ValueError("всегда")))
+    try:
+        with pytest.raises(ValueError):
+            run_stratum.mine_forever("127.0.0.1", p.port, f"{WALLET}/rig", 256, 256, 2048, cert_version=CERT,
+                                     base_delay=0.01, max_crashes=3, log=lambda *_: None)
+    finally:
+        p.stop()
+
+
+# ---------------------------------------------------------------------------
+# Автовыбор размера матриц: большие попытки лучше амортизируют накладные расходы (замер: 26 -> 41 TMAC/s)
+# ---------------------------------------------------------------------------
+def test_auto_matrix_size_follows_free_gpu_memory():
+    gib = 1 << 30
+    assert run_stratum.auto_size(2048, depth=3, free_bytes=6 * gib) == 16384
+    assert run_stratum.auto_size(2048, depth=3, free_bytes=3 * gib) == 8192
+    assert run_stratum.auto_size(2048, depth=3, free_bytes=int(1.2 * gib)) == 4096
+    assert run_stratum.auto_size(2048, depth=3, free_bytes=64 << 20) == 4096        # минимум, дальше не уменьшаем
+    assert run_stratum.auto_size(4096, depth=3, free_bytes=6 * gib) == 8192          # k вдвое больше -> попытка вдвое тяжелее
+    assert run_stratum.auto_size(2048, depth=1, free_bytes=2 * gib) == 16384
+
+
+def test_cli_auto_size_zero_means_auto(monkeypatch):
+    import miner
+    seen = {}
+
+    def fake_forever(host, port, login, m, n, k, rank=128, **kw):
+        seen.update(m=m, n=n, k=k)
+        return {"accepted": 0}
+
+    monkeypatch.setattr(run_stratum, "mine_forever", fake_forever)
+    monkeypatch.setattr(run_stratum, "auto_size", lambda k, depth=3, free_bytes=None: 8192)
+    assert miner.main(["--stratum", "--pool", "127.0.0.1:1", "--wallet", f"{WALLET}/rig"]) == 0
+    assert (seen["m"], seen["n"]) == (8192, 8192)
+    seen.clear()
+    assert miner.main(["--stratum", "--pool", "127.0.0.1:1", "--wallet", f"{WALLET}/rig", "--m", "4096", "--n", "2048"]) == 0
+    assert (seen["m"], seen["n"]) == (4096, 2048)                                     # явные значения главнее автовыбора

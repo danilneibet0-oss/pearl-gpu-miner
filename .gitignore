@@ -15,3 +15,4 @@ pearl/
 start_pool.bat
 .pytest_cache/
 release_slim/
+release_fix/

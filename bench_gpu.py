@@ -33,8 +33,12 @@ def bench_kernel(m, n, k, rank=128, iters=20, variant="auto"):
     ridx = cp.asarray(rt.reshape(-1).astype(np.int32))
     cidx = cp.asarray(ct.reshape(-1).astype(np.int32))
     out = cp.empty((rt.shape[0], ct.shape[0], 16), dtype=cp.uint32)
+    seed_w = cp.asarray(np.arange(8, dtype=np.uint32))                    # как в реальной работе: джекпот-хеш и сравнение
+    bound_w = cp.asarray(np.frombuffer((ref.U256_MAX >> 24).to_bytes(32, "little"), dtype="<u4").copy())   # со сложностью внутри
+    best = cp.zeros(1, dtype=cp.uint32)                                   # ядра, массив джекпотов не пишется
+
     def kern(*_):
-        pearl_gpu.jackpots_dev(a, bt, rank, rt, ct, variant)
+        pearl_gpu.jackpots_dev(a, bt, rank, rt, ct, variant, search=(seed_w, bound_w, best))
     grid, args = None, None
     kern(grid, (32,), args)
     cp.cuda.Device().synchronize()
@@ -153,8 +157,8 @@ def main():
     print(f"GPU: {props['name'].decode()}, SM: {props['multiProcessorCount']}")
     print(f"\n== Ядро джекпота (чистое время ядра, cudaEvent) ==")
     print(f"{'m':>6} {'n':>6} {'k':>6} {'мс':>8} {'TMAC/s':>8} {'TOPS':>8} {'% пика':>7}")
-    for m, n, k in [(1024, 1024, 2048), (2048, 2048, 2048), (4096, 4096, 2048),
-                    (4096, 4096, 4096), (8192, 4096, 2048)]:        # протокол: k >= 16*rank = 2048
+    for m, n, k in [(2048, 2048, 2048), (4096, 4096, 2048), (8192, 8192, 2048),
+                    (16384, 8192, 2048), (4096, 4096, 4096)]:        # протокол: k >= 16*rank = 2048
         sec, macs = bench_kernel(m, n, k)
         tops = 2 * macs / 1e12
         print(f"{m:6d} {n:6d} {k:6d} {sec*1e3:8.2f} {macs/1e12:8.2f} {tops:8.2f} {100*tops/PEAK_INT8_DENSE_TOPS:6.1f}%")
@@ -183,8 +187,8 @@ def main():
 
 def _tail():
     print("\n##### Пропускная способность (3 попытки в разных CUDA-потоках, лучшее из 4 прогонов) #####")
-    for m, n, k in [(2048, 2048, 2048), (4096, 4096, 2048), (4096, 4096, 4096)]:
-        t = throughput(m, n, k)
+    for m, n, k in [(4096, 4096, 2048), (8192, 8192, 2048), (16384, 16384, 2048)]:
+        t = throughput(m, n, k, depth=2 if m >= 8192 else 3, attempts=30 if m >= 16384 else 60)
         macs = m * n * k
         print(f"  {m}x{n}x{k}: {t*1e3:6.3f} мс/попытку, {1/t:6.0f} попыток/с, "
               f"{macs/t/1e12:5.1f} TMAC/s = {2*macs/t/1e12:5.1f} TOPS эффективно")

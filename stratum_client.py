@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import re
 import socket
 import ssl
 import threading
@@ -46,6 +47,32 @@ class StratumJob:
 
     def header(self) -> ref.IncompleteBlockHeader:
         return ref.IncompleteBlockHeader.from_bytes(self.header_bytes)
+
+
+def parse_error(err) -> tuple[int, str]:
+    """
+    Ошибка пула -> (код, сообщение). Форматы встречаются разные: {"code","msg"|"message"} (спецификация Suprnova),
+    [код, сообщение, данные] (классический Stratum v1, так отвечает Kryptex), строка или число.
+    """
+    def to_int(v) -> int:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+
+    if isinstance(err, dict):
+        return to_int(err.get("code")), str(err.get("msg") or err.get("message") or "")
+    if isinstance(err, (list, tuple)):
+        code = to_int(err[0]) if err else 0
+        msg = str(err[1]) if len(err) > 1 and err[1] is not None else ""
+        return code, msg
+    if isinstance(err, bool):
+        return 0, ""
+    if isinstance(err, int):
+        return err, ""
+    text = str(err)
+    m = re.match(r"\s*\[?(\d+)\]?\s*[:,.-]?\s*(.*)", text, re.S)       # «21: stale job», «[21] stale job»
+    return (int(m.group(1)), m.group(2)) if m else (0, text)
 
 
 def parse_job(params: dict) -> StratumJob:
@@ -171,7 +198,8 @@ class StratumClient:
             raise ConnectionError("соединение закрыто") if self._closed else TimeoutError(f"{method}: нет ответа")
         err = resp.get("error")
         if err:
-            raise StratumError(int(err.get("code", 0)), str(err.get("msg", "")))
+            code, msg = parse_error(err)
+            raise StratumError(code, msg)
         return resp if full else resp.get("result")
 
     def authorize(self, login: str, password: str | None = None, agent: str = "pearl-gpu-miner/0.1",

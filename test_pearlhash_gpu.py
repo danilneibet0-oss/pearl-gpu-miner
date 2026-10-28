@@ -183,3 +183,58 @@ def test_v2_all_zero_and_constant_inputs():
         bt = np.full((n, k), val, dtype=np.int8)
         want = ref.jackpots_all_tiles(a.astype(np.int32), bt.astype(np.int32), RANK, rt, ct)
         np.testing.assert_array_equal(pearl_gpu.jackpots(a, bt, RANK, rt, ct, variant="v2"), want)
+
+
+# ---------------------------------------------------------------------------
+# Ядро v3 (ldmatrix, отложенная XOR-свёртка): побитово с эталоном; только rank 128
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("m,n,k", [
+    (128, 128, 2048),           # один блок
+    (640, 384, 2048),           # 5x3 блоков
+    (256, 256, 2176),           # 17 rank-блоков: слоты джекпота переиспользуются
+    (256, 256, 2112),           # хвост 64 < rank игнорируется
+    (256, 256, 5120),           # 40 rank-блоков
+    (256, 256, 128),            # ровно один rank-блок
+    (256, 256, 1024),           # 8 rank-блоков
+])
+def test_v3_matches_ref_and_v2(m, n, k):
+    rng = np.random.default_rng(m * 7 + n + k)
+    a = rng.integers(-128, 128, size=(m, k), dtype=np.int8)
+    bt = rng.integers(-128, 128, size=(n, k), dtype=np.int8)
+    cfg = ref.MiningConfiguration(k, 128, _patterns("default")[0], _patterns("default")[1])
+    rt, ct = cfg.rows_pattern.partition(m), cfg.cols_pattern.partition(n)
+    want = ref.jackpots_all_tiles(a.astype(np.int32), bt.astype(np.int32), 128, rt, ct)
+    np.testing.assert_array_equal(pearl_gpu.jackpots(a, bt, 128, rt, ct, variant="v3"), want)
+    assert pearl_gpu.last_variant == "v3"                     # действительно запускалось ядро v3, а не запасное
+    np.testing.assert_array_equal(pearl_gpu.jackpots(a, bt, 128, rt, ct, variant="v2"), want)
+    assert pearl_gpu.last_variant == "v2"
+
+
+def test_v3_constant_and_extreme_inputs():
+    m = n = 256
+    k = 2048
+    cfg = _cfg(k)
+    rt, ct = cfg.rows_pattern.partition(m), cfg.cols_pattern.partition(n)
+    for val in (0, 1, -128, 127):
+        a = np.full((m, k), val, dtype=np.int8)
+        bt = np.full((n, k), val, dtype=np.int8)
+        want = ref.jackpots_all_tiles(a.astype(np.int32), bt.astype(np.int32), RANK, rt, ct)
+        np.testing.assert_array_equal(pearl_gpu.jackpots(a, bt, RANK, rt, ct, variant="v3"), want)
+        assert pearl_gpu.last_variant == "v3"
+
+
+def test_unknown_variant_is_an_error():
+    cfg = _cfg(2048)
+    rt, ct = cfg.rows_pattern.partition(128), cfg.cols_pattern.partition(128)
+    z = np.zeros((128, 2048), dtype=np.int8)
+    with pytest.raises(ValueError):
+        pearl_gpu.jackpots(z, z, RANK, rt, ct, variant="v9")
+
+
+def test_v3_not_used_for_other_ranks_and_auto_prefers_it():
+    assert pearl_gpu.v3_supported(256, 384, 2048, 128, 4, 16)
+    assert not pearl_gpu.v3_supported(256, 384, 4096, 256, 4, 16)          # rank 256 -> v2
+    assert not pearl_gpu.v3_supported(200, 384, 2048, 128, 4, 16)
+    assert pearl_gpu.chosen_variant(256, 384, 2048, 128, 4, 16) == "v3"
+    assert pearl_gpu.chosen_variant(256, 384, 4096, 256, 4, 16) == "v2"
+    assert pearl_gpu.chosen_variant(256, 384, 2048, 128, 8, 16) == "simple"

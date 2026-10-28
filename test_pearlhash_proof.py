@@ -98,3 +98,20 @@ def test_official_cpu_miner_agrees_with_our_verifier_path():
     assert plain is not None
     ok, msg = pm.verify_plain_proof_for_cert_version(3, pr.to_pm_header(header), plain)
     assert ok, msg
+
+
+@pytest.mark.parametrize("sparse", [None, 32])
+def test_large_attempt_verifies_officially(sparse):
+    """Крупные попытки (как при автоподборе размера) тоже дают доказательство, проходящее официальную проверку."""
+    m, n, k = 8192, 4096, 2048
+    cfg = ref.default_config(k)
+    header = _header(0x1E00FFFF)
+    sol = None
+    for seed in range(20):
+        sol = pp.mine_random(m, n, k, header, cfg, 3, seed=seed, sparse_nnz=sparse)
+        if sol:
+            break
+    assert sol is not None and sol.a.shape == (m, k) and sol.b.shape == (k, n)
+    proof = pr.build_plain_proof(sol, header, cfg)
+    ok, msg = pr.verify_before_submit(3, header, proof)
+    assert ok, msg

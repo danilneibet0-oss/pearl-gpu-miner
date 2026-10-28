@@ -32,6 +32,29 @@ SPARSE_NNZ = 32                  # ненулевых ячеек в A и в B^T 
 FATAL_AUTH = {24, 25}            # нет кошелька / неверный кошелёк: повторять бессмысленно
 
 
+MATRIX_SIZES = (16384, 8192, 4096)        # кандидаты для m = n (кратны 128, период паттернов)
+
+
+def auto_size(k: int, depth: int = 3, free_bytes: int | None = None) -> int:
+    """
+    Размер m = n для попытки. Чем больше матрицы, тем лучше накладные расходы (хеши, шум) делятся на работу ядра:
+    замер на RTX 3060 Ti — 26 TMAC/s при 4096 и 41 TMAC/s при 16384. Берём наибольший размер, для которого
+    depth одновременных попыток займут не больше 60% свободной памяти GPU (с запасом на кэш аллокатора: ×6).
+    """
+    if free_bytes is None:
+        import cupy as cp
+        free_bytes = int(cp.cuda.runtime.memGetInfo()[0])
+    for size in MATRIX_SIZES:
+        need = depth * 6 * 4 * size * k          # A, B, A_шум, B_шум на попытку
+        if need <= 0.6 * free_bytes:
+            return size
+    return MATRIX_SIZES[-1]
+
+
+class FatalMinerError(RuntimeError):
+    """Намеренная остановка майнера (повторять бессмысленно): серия отказов, неприменимая цель, нет cert_version."""
+
+
 def new_stats() -> dict:
     return {"attempts": 0, "found": 0, "accepted": 0, "rejected": 0, "stale": 0, "duplicate": 0, "reconnects": 0}
 
@@ -63,11 +86,11 @@ def run(client: StratumClient, m: int, n: int, k: int, rank: int = 128, *, cert_
             log(f"новое задание {job.job_id}, высота {job.height}")
         bound = job_bound(job, cfg)
         if bound is None:
-            raise RuntimeError("цель задания неприменима к этой конфигурации")
+            raise FatalMinerError("цель задания неприменима к этой конфигурации")
         header = job.header()
         cert = job.cert_version if job.cert_version is not None else cert_version
         if cert is None:
-            raise RuntimeError("пул не прислал cert_version, а параметр cert_version не задан")
+            raise FatalMinerError("пул не прислал cert_version, а параметр cert_version не задан")
         base = int.from_bytes(os.urandom(6), "little")
         for _seed, sol in pp.mine_random_pipelined(m, n, k, header, cfg, cert,
                                                    range(base, base + batch), bound=bound, depth=depth,
@@ -89,7 +112,9 @@ def run(client: StratumClient, m: int, n: int, k: int, rank: int = 128, *, cert_
                 stats["rejected"] += 1
                 continue
             try:
-                client.submit(job.job_id, pr.proof_to_base64(proof))
+                accepted = client.submit(job.job_id, pr.proof_to_base64(proof))
+                if not accepted:                          # result=false без объекта ошибки — это отказ, а не принятый шар
+                    raise StratumError(0, "пул вернул result=false")
             except StratumError as e:
                 if e.code == 21:
                     stats["stale"] += 1
@@ -102,7 +127,7 @@ def run(client: StratumClient, m: int, n: int, k: int, rank: int = 128, *, cert_
                 bad_in_row += 1
                 log(f"шар отклонён: {e}")
                 if bad_in_row >= MAX_BAD:
-                    raise RuntimeError(f"{MAX_BAD} отказа подряд ({e}); останавливаюсь, чтобы не спамить пул. "
+                    raise FatalMinerError(f"{MAX_BAD} отказа подряд ({e}); останавливаюсь, чтобы не спамить пул. "
                                        "Проверьте cert_version и трактовку target (см. docstring run_stratum).") from e
                 continue
             bad_in_row = 0
@@ -120,15 +145,18 @@ def mine_forever(host: str, port: int, login: str, m: int, n: int, k: int, rank:
                  max_shares: int | None = None, max_reconnects: int | None = None,
                  base_delay: float = 2.0, max_delay: float = 60.0,
                  stop: threading.Event | None = None, log=print, report_s: float = 30.0,
-                 dense: bool = False) -> dict:
+                 dense: bool = False, max_crashes: int = 5) -> dict:
     """
     Майнинг «пока не остановят»: при обрыве/таймауте — переподключение с паузой base_delay·2^n (до max_delay),
     пауза сбрасывается после успешной авторизации. Фатальные ошибки (неверный кошелёк, серия отказов шаров)
     пробрасываются наружу без повторов. max_reconnects=None — бесконечно (для тестов можно ограничить).
+    Неожиданное исключение (ошибка в самом майнере или нестандартный ответ пула) не убивает ночной майнинг:
+    traceback пишется в лог, соединение пересоздаётся; но max_crashes подряд без единого принятого шара — остановка.
     """
     stop = stop or threading.Event()
     stats = new_stats()
     fails = 0
+    crashes, accepted_at_crash = 0, -1
     while not stop.is_set() and (max_shares is None or stats["accepted"] < max_shares):
         try:
             with StratumClient(host, port, tls=tls, timeout=30) as client:
@@ -138,6 +166,8 @@ def mine_forever(host: str, port: int, login: str, m: int, n: int, k: int, rank:
                     f"матрицы: {'случайные' if (dense or not client.gzip) else 'разреженные'}")
                 run(client, m, n, k, rank, cert_version=cert_version, max_shares=max_shares, stop=stop,
                     log=log, stats=stats, report_s=report_s, dense=dense)
+        except FatalMinerError:
+            raise
         except StratumError as e:
             if e.code in FATAL_AUTH:
                 raise
@@ -145,6 +175,13 @@ def mine_forever(host: str, port: int, login: str, m: int, n: int, k: int, rank:
         except (ConnectionError, TimeoutError, OSError) as e:
             log(f"связь с пулом потеряна: {e}")
             if max_reconnects is not None and fails >= max_reconnects:
+                raise
+        except Exception as e:                              # noqa: BLE001 — намеренно: майнер не должен падать молча
+            import traceback
+            log("Неожиданная ошибка (майнер продолжит работу): " + "".join(traceback.format_exception(e)).strip())
+            crashes = crashes + 1 if stats["accepted"] == accepted_at_crash else 1
+            accepted_at_crash = stats["accepted"]
+            if crashes >= max_crashes:
                 raise
         else:
             continue                                       # run завершился штатно (stop / max_shares)

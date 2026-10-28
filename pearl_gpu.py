@@ -19,6 +19,7 @@ import cupy as cp
 import pearlhash_ref as ref
 from blake3_cuda import CORE
 from gpu_arch import nvrtc_arch
+import pearl_gpu_v3
 
 _KERNEL_SRC = r"""
 typedef unsigned int u32;
@@ -301,6 +302,22 @@ def v2_supported(m: int, n: int, k: int, rank: int, th: int, tw: int) -> bool:
     return th == 4 and tw == 16 and m % 128 == 0 and n % 128 == 0 and k % 64 == 0 and rank % 64 == 0 and k >= rank
 
 
+def v3_supported(m: int, n: int, k: int, rank: int, th: int, tw: int) -> bool:
+    return rank == 128 and v2_supported(m, n, k, rank, th, tw)
+
+
+def chosen_variant(m: int, n: int, k: int, rank: int, th: int, tw: int, variant: str = "auto") -> str:
+    """Какое ядро будет запущено: v3 (rank 128), v2 (прочие rank), либо универсальное «simple»."""
+    if variant == "auto":
+        return "v3" if v3_supported(m, n, k, rank, th, tw) else "v2" if v2_supported(m, n, k, rank, th, tw) else "simple"
+    if variant not in ("simple", "v2", "v3"):
+        raise ValueError(f"неизвестный вариант ядра: {variant!r}")
+    return variant
+
+
+last_variant = None          # какое ядро реально запускалось последним (для тестов и диагностики)
+
+
 _modules: dict = {}
 
 
@@ -326,7 +343,7 @@ def jackpots_dev(a_noised, bt_noised, rank: int, row_tiles: np.ndarray, col_tile
     """
     search: (ключ a_seed [8 u32], граница [8 u32 LE], best [1 u32]) — только v2: джекпот-хеш и сравнение со
     сложностью делаются в самом ядре, массив джекпотов не пишется; в best — atomicMin индекса тайла ti*T_c+tj.
-    variant: "auto" (v2 для тайла 4x16 при m,n кратных 128, иначе простое ядро), "simple" или "v2".
+    variant: "auto" (v3 для rank 128, v2 для прочих rank при тайле 4x16 и m,n кратных 128, иначе простое ядро), "simple", "v2" или "v3".
     a_noised: m×k int8, bt_noised: n×k int8 (numpy или cupy).
     row_tiles/col_tiles: индексы тайлов из PeriodicPattern.partition (T×size).
     Возвращает (T_r, T_c, 16) uint32 на GPU — как pearlhash_ref.jackpots_all_tiles.
@@ -344,11 +361,21 @@ def jackpots_dev(a_noised, bt_noised, rank: int, row_tiles: np.ndarray, col_tile
     assert (t_r * th) % 16 == 0, "число строк A должно делиться на 16"
 
     ridx, cidx = _device_indices(row_tiles), _device_indices(col_tiles)
-    use_v2 = v2_supported(m, n, k, rank, th, tw) if variant == "auto" else variant == "v2"
+    global last_variant
+    last_variant = chosen_variant(m, n, k, rank, th, tw, variant)
     if search is not None:
-        assert use_v2, "поиск внутри ядра есть только у v2"
+        assert last_variant in ("v2", "v3"), "поиск внутри ядра есть только у v2 и v3"
     out = cp.empty(1 if search is not None else (t_r, t_c, 16), dtype=cp.uint32)
-    if use_v2:
+    if last_variant == "v3":
+        assert v3_supported(m, n, k, rank, th, tw), "v3: rank 128, тайл 4x16, m,n кратны 128, k кратно 64"
+        nst = (k - k % rank) // 64
+        skey, sbound, best = search if search is not None else (out, out, out)
+        pearl_gpu_v3.kernel()(((n // 128) * (m // 128),), (256,),
+                              (a, bt, ridx, cidx, out, np.int32(k), np.int32(t_c), np.int32(nst), np.int32(rank // 64),
+                               np.int32(search is not None), skey, sbound, best, np.int32(n // 128), np.int32(m // 128)),
+                              shared_mem=pearl_gpu_v3.smem_bytes())
+        return out
+    if last_variant == "v2":
         assert v2_supported(m, n, k, rank, th, tw), "v2: нужен тайл 4x16, m,n кратны 128, k кратно 64"
         nst = (k - k % rank) // 64
         skey, sbound, best = search if search is not None else (out, out, out)
