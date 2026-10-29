@@ -202,7 +202,7 @@ class StratumClient:
             raise StratumError(code, msg)
         return resp if full else resp.get("result")
 
-    def authorize(self, login: str, password: str | None = None, agent: str = "pearl-gpu-miner/0.2.0",
+    def authorize(self, login: str, password: str | None = None, agent: str = "pearl-gpu-miner/0.2.1",
                   v2: bool = True) -> bool:
         """
         v2=True: в параметрах "type": "v2" — протокол Kryptex со сжатием; если пул вернул "type": "v2", то plain_proof

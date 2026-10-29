@@ -17,6 +17,7 @@ mine_forever — длительная работа: переподключени
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 import time
 
@@ -77,13 +78,33 @@ def new_stats() -> dict:
             "expected": 0.0}
 
 
+def gpu_status() -> dict | None:
+    """Состояние GPU 0 из nvidia-smi (температура, частоты, вентилятор, мощность); None, если утилиты нет."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,temperature.gpu,clocks.sm,clocks.mem,fan.speed,power.draw,utilization.gpu",
+             "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.splitlines()[0]
+        name, temp, sm, mem, fan, power, util = (x.strip() for x in out.split(","))
+        return {"name": name, "temp": temp, "sm": sm, "mem": mem, "fan": fan, "power": float(power), "util": util}
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
 def _report(stats: dict, m: int, n: int, k: int, since: float, attempts0: int, log) -> None:
     dt = max(time.time() - since, 1e-9)
     rate = (stats["attempts"] - attempts0) / dt
     tmacs = rate * m * n * k / 1e12
+    log("=" * 78)
     log(f"{rate:.0f} попыток/с ≈ {tmacs:.1f} TMAC/s | шаров: принято {stats['accepted']}, "
         f"отклонено {stats['rejected']}, устарело {stats['stale']}, дубликатов {stats['duplicate']} | "
         f"попыток всего {stats['attempts']}, ожидалось шаров по целям заданий {stats['expected']:.1f}")
+    gpu = gpu_status()
+    if gpu:
+        eff = f" | {tmacs * 1000 / gpu['power']:.0f} GMAC/s на Вт" if gpu["power"] > 0 else ""
+        log(f"GPU0 {gpu['name']}: T: {gpu['temp']}c CC: {gpu['sm']}MHz MC: {gpu['mem']}MHz FAN: {gpu['fan']}% "
+            f"P: {gpu['power']:.0f}W загрузка: {gpu['util']}%{eff}")
+    log("=" * 78)
 
 
 def run(client: StratumClient, m: int, n: int, k: int, rank: int = 128, *, cert_version: int | None = None,
